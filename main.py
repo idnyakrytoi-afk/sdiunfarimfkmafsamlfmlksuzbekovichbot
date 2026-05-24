@@ -37,20 +37,21 @@ spam_warnings = {}
 spam_tracker = {}
 music_queues = {}
 
-# 3. Настройки и ID каналов (Замените на свои настоящие ID!)
-LOG_CHANNEL_ID = 123456789012345678
-TICKET_CATEGORY_ID = 123456789012345678
-WHITELISTED_USERS = ["zabiv"]
-our_server_invite = "discord.gg/"
+# 3. Настройки и ID каналов
+LOG_CHANNEL_ID = 1500133161173254196
+TICKET_CATEGORY_ID = 1500197078217789440
+WHITELISTED_USERS = ["gs_uzbekovi4"]
+our_server_invite = "https://discord.gg/ur5tPZ7umw"
 cached_server_context = "Ты крутой бот-помощник."
 
-LEVEL_ROLES = {"хороший участник": 666666666666666666}
+LEVEL_ROLES = {"хороший участник": 1500210317140037702}
 ROLE_REQUIREMENTS = {"хороший участник": {"messages": 100, "voice_hours": 10.0}}
+
 # Магазин: ключ = item_id. Для предметов указываем type="item", для ролей type="role" и role_id
 SHOP_ITEMS = {
-    "vip": {"name": "VIP", "price": 1000, "type": "role", "role_id": 666666666666666666},
-    "pizza": {"name": "Пицца 🍕", "price": 150, "type": "item"},
-    "color": {"name": "Цветной ник", "price": 500, "type": "item"},
+    "vip": {"name": "VIP", "price": 1000, "type": "role", "role_id": 1506636782614220920},
+    "pizza": {"name": "Пицца 🍕", "price": 150, "type": "role", "role_id": 1506636616947466300},
+    "color": {"name": "", "price": 500, "type": "item"},
     "lockpick": {"name": "Отмычка 🔓", "price": 300, "type": "item"},
     # Недвижимость / источники пассивного дохода
     "house_small": {"name": "Маленький дом 🏠", "price": 5000, "type": "property", "income": 50},
@@ -60,7 +61,6 @@ SHOP_ITEMS = {
     # Лутбокс — при покупке сразу даёт случайный предмет/монеты
     "lootbox": {"name": "Лутбокс 🎁", "price": 500, "type": "lootbox"}
 }
-
 # Локальное хранилище инвентарей/допол. данных (оставлено для совместимости)
 users_data = {}
 USERS_DATA_FILE = "users_data.json"
@@ -358,8 +358,8 @@ async def on_presence_update(before, after):
         
     good_member_role_id = LEVEL_ROLES.get("хороший участник")
     
-    # Проверяем, настроена ли роль
-    if not good_member_role_id or good_member_role_id == 666666666666666666:
+# Проверяем, настроена ли роль
+    if not good_member_role_id:
         return
 
     good_member_role = after.guild.get_role(good_member_role_id)
