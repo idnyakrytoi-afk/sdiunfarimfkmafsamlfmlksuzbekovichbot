@@ -1,0 +1,34 @@
+{
+    "1349818658653737060": {
+        "messages": 57,
+        "voice_seconds": 17526.395908,
+        "last_message_ts": 1779467924.86858,
+        "name": "Uzbekovich",
+        "avatar": "https://cdn.discordapp.com/guilds/1500133159457787924/users/1349818658653737060/avatars/f78b49a7c911523939f002e7de418778.png?size=1024",
+        "balance": 999999999999999999,
+        "last_work_ts": 1779451695.237881,
+        "last_rep_ts": 1779294693.542535
+    },
+    "1453438497716179069": {
+        "messages": 1,
+        "voice_seconds": 561.14703,
+        "last_message_ts": 1779470572.001892,
+        "balance": 0,
+        "last_work_ts": 0,
+        "reputation": 0,
+        "last_rep_ts": 0,
+        "name": "fesdtsa",
+        "avatar": "https://cdn.discordapp.com/avatars/1453438497716179069/0bcf073754c2b1f7aa7f893bde0035a4.png?size=1024"
+    },
+    "1279819682123354195": {
+        "messages": 0,
+        "voice_seconds": 12.173455,
+        "last_message_ts": 0,
+        "balance": 0,
+        "last_work_ts": 0,
+        "reputation": 0,
+        "last_rep_ts": 0,
+        "name": "\u0410\u043c\u0438\u0440\u043a\u0430",
+        "avatar": "https://cdn.discordapp.com/avatars/1279819682123354195/3cec4b9df6bfcd7e6c442509a6f50545.png?size=1024"
+    }
+}
