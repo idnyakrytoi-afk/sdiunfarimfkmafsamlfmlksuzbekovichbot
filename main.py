@@ -346,6 +346,11 @@ async def on_ready():
     # Запускаем планировщик и поллер фидов
     bot.loop.create_task(scheduler_loop())
     bot.loop.create_task(feed_poller_loop())
+    bot.loop.create_task(giveaway_loop())
+    bot.loop.create_task(stats_tracker_loop())
+
+    # Регистрируем персистентные view для кнопок
+    bot.add_view(GiveawayView(giveaway_id="placeholder"))
 
     print(f"✅ Бот успешно запущен и авторизован как {bot.user}!")
     print("Ожидаю сообщений и команд...")
@@ -928,6 +933,28 @@ async def on_voice_state_update(member, before, after):
             # Проверяем, не заслужил ли он роль
             await check_and_award_roles(member)
 
+            # Начисление сезонных очков (+5 за каждые 10 минут в войсе)
+            try:
+                voice_minutes = duration_seconds / 60
+                season_points = int(voice_minutes // 10) * 5
+                if season_points > 0:
+                    season = load_season()
+                    uid = str(member.id)
+                    season['points'][uid] = season['points'].get(uid, 0) + season_points
+                    await save_season(season)
+            except Exception:
+                pass
+
+            # Обновление статистики войса
+            try:
+                stats = load_stats()
+                today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+                stats.setdefault("voice", {})
+                stats["voice"][today] = stats["voice"].get(today, 0) + (duration_seconds / 60)
+                await save_stats(stats)
+            except Exception:
+                pass
+
 @bot.hybrid_command(name="rank", description="Показать ваш уровень и прогресс активности")
 async def rank(ctx, member: discord.Member = None):
     member = member or ctx.author
@@ -1035,11 +1062,9 @@ async def leaderboard(ctx):
 @bot.hybrid_command(name="leaderboard_coins", description="Показать топ самых богатых пользователей сервера")
 async def leaderboard_coins(ctx):
     await ctx.defer()
-    # Табличный лидерборд по чистому состоянию
     rows = await database.get_all_users()
     if not rows:
-        await ctx.send("Пока нет данных для отображения лидерборда.", ephemeral=True)
-        return
+        return await ctx.send("Пока нет данных.", ephemeral=True)
 
     table_rows = []
     for r in rows:
@@ -1047,18 +1072,52 @@ async def leaderboard_coins(ctx):
         bal = r['balance'] or 0
         bank = r['bank'] or 0
         props = users_data.get(uid, {}).get('properties', [])
-        props_value = sum([p.get('value', 0) for p in props])
-        net = bal + bank + props_value
+        props_value = sum(p.get('value', 0) for p in props)
+        inv = users_data.get(uid, {}).get('inventory', {})
+        inv_value = sum(SHOP_ITEMS.get(item, {}).get('price', 0) * count for item, count in inv.items())
+        net = bal + bank + props_value + inv_value
         name = r['name'] if r['name'] else f'ID:{uid}'
-        table_rows.append((name, str(net), str(bal), str(bank), str(props_value)))
+        messages = r['messages'] or 0
+        voice_sec = r['voice_seconds'] or 0
+        xp = messages * 2 + int(voice_sec // 60)
+        level = int((xp ** 0.5) / 2) + 1
+        table_rows.append((name, net, bal, bank, props_value, inv_value, level))
 
-    # Сортируем и формируем строки
-    table_rows = sorted(table_rows, key=lambda x: int(x[1]), reverse=True)
-    headers = ["Ник", "Состояние", "Наличные", "Банк", "Недвижимость"]
+    table_rows = [t for t in table_rows if t[1] > 0]
+    if not table_rows:
+        return await ctx.send("Пока никто не заработал ни монеты.", ephemeral=True)
 
-    paginator = TablePaginator(ctx, "💰 Топ по чистому состоянию", headers, table_rows, page_size=8, color=discord.Color.gold())
-    embed = paginator._get_page_embed()
-    await ctx.send(embed=embed, view=paginator)
+    table_rows.sort(key=lambda x: x[1], reverse=True)
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (name, net, bal, bank, props, inv, level) in enumerate(table_rows[:15]):
+        medal = medals[i] if i < 3 else f"**{i+1}.**"
+        net_str = f"{net:,}".replace(",", ".")
+        lines.append(f"{medal} **{name[:18]}** — {net_str} монет | Ур. **{level}**")
+
+    # Детали топ-3
+    details = []
+    for i, (name, net, bal, bank, props, inv, level) in enumerate(table_rows[:3]):
+        medal = medals[i]
+        bal_s = f"{bal:,}".replace(",", ".")
+        bank_s = f"{bank:,}".replace(",", ".")
+        props_s = f"{props:,}".replace(",", ".")
+        inv_s = f"{inv:,}".replace(",", ".")
+        net_s = f"{net:,}".replace(",", ".")
+        details.append(f"{medal} **{name[:20]}** — Ур. **{level}**\n"
+                       f"💰 Наличные: `{bal_s}` | 🏦 Банк: `{bank_s}`\n"
+                       f"🏠 Недвижимость: `{props_s}` | 🎒 Инвентарь: `{inv_s}`\n"
+                       f"📊 **Итого: {net_s}**\n\u200b")
+
+    embed = discord.Embed(title="💰 Топ богачей сервера", color=discord.Color.gold())
+    if details:
+        embed.description = "\n".join(details)
+    if len(table_rows) > 3:
+        rest = "\n".join(lines[3:])
+        embed.add_field(name="\u200b", value=rest, inline=False)
+    embed.set_footer(text=f"Всего участников в топе: {len(table_rows)}")
+    await ctx.send(embed=embed)
 
 @bot.hybrid_command(name="weather", description="Показать погоду в указанном городе")
 async def weather(ctx, *, city: str):
@@ -1727,6 +1786,14 @@ async def craft(ctx, recipe_id: str):
     await save_user_data(users_data)
     await ctx.send(f"🔨 Вы успешно скрафтили {', '.join([f'{q}x {r}' for r, q in recipe['gives'].items()])}.")
 
+    # Начисление сезонных очков за крафт (+10)
+    try:
+        season = load_season()
+        season['points'][user_id] = season['points'].get(user_id, 0) + 10
+        await save_season(season)
+    except Exception:
+        pass
+
 @bot.hybrid_command(name="gamble", description="Сыграть в Орла или Решку")
 async def gamble(ctx, amount: int, choice: str):
     user_id = str(ctx.author.id)
@@ -1883,7 +1950,8 @@ class HelpView(discord.ui.View):
             "💰 — **Экономика и Казино**\n"
             "🤖 — **Нейросети**\n"
             "🎵 — **Музыка**\n"
-            "🎉 — **Развлечения**\n"
+            "🎲 — **Мини-игры**\n"
+            "🎉 — **Розыгрыши и Сезон**\n"
             "⚙️ — **Разное**\n\n"
             "*💡 Бот также автоматически наказывает за спам, мат и отправку ссылок!*"
         )
@@ -1914,14 +1982,19 @@ class HelpView(discord.ui.View):
         desc = "**Управление музыкальным плеером в войсе:**\n\n🔹 `/play <запрос/ссылка>` — Включить трек или добавить в очередь\n🔹 `/pause` / `/resume` — Пауза / Возобновить\n🔹 `/skip` — Пропустить текущий трек\n🔹 `/queue` — Показать очередь треков\n🔹 `/stop` — Остановить музыку и очистить очередь"
         await self.update_embed(interaction, "🎵 Музыка", desc, discord.Color.purple())
 
-    @discord.ui.button(label="Развлечения", style=discord.ButtonStyle.secondary, emoji="🎉", row=2)
+    @discord.ui.button(label="Развлечения", style=discord.ButtonStyle.secondary, emoji="🎲", row=2)
     async def fun_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        desc = "**Команды для развлечения и взаимодействия:**\n\n🔹 `/hug <юзер>` — Обнять пользователя\n🔹 `/slap <юзер>` — Дать пощечину"
-        await self.update_embed(interaction, "🎉 Развлечения", desc, discord.Color.magenta())
+        desc = "**Мини-игры для развлечения:**\n\n🔹 `/dice [число]` — Бросить кости\n🔹 `/rps <камень/ножницы/бумага>` — Камень-Ножницы-Бумага\n🔹 `/quiz` — Викторина (5 вопросов, награда за 3+)\n🔹 `/hug <юзер>` — Обнять пользователя\n🔹 `/slap <юзер>` — Дать пощечину"
+        await self.update_embed(interaction, "🎲 Мини-игры", desc, discord.Color.magenta())
 
-    @discord.ui.button(label="Разное", style=discord.ButtonStyle.secondary, emoji="⚙️", row=2)
+    @discord.ui.button(label="Розыгрыши", style=discord.ButtonStyle.secondary, emoji="🎉", row=2)
+    async def giveaway_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        desc = "**Розыгрыши и сезонная система:**\n\n🔹 `/giveaway <время> <приз>` — Создать розыгрыш (админ)\n🔹 `/giveaway_end <ID>` — Завершить досрочно (админ)\n🔹 `/season_start` — Начать сезон (админ)\n🔹 `/season_end` — Завершить сезон (админ)\n🔹 `/season_top` — Топ сезона\n🔹 `/season_rank [юзер]` — Ваше место\n\n*Очки сезона: +1 за сообщение, +5 за 10 мин. войса, +10 за крафт, +20 за викторину*"
+        await self.update_embed(interaction, "🎉 Розыгрыши и Сезон", desc, discord.Color.gold())
+
+    @discord.ui.button(label="Разное", style=discord.ButtonStyle.secondary, emoji="⚙️", row=3)
     async def misc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        desc = "**Полезные утилиты и другие команды:**\n\n🔹 `/weather <город>` — Узнать актуальную погоду\n🔹 `/ping` — Проверить работу бота\n🔹 `/suggest <текст>` — Анонимное предложение администрации"
+        desc = "**Полезные утилиты:**\n\n🔹 `/weather <город>` — Узнать погоду\n🔹 `/ping` — Проверить работу бота\n🔹 `/suggest <текст>` — Анонимное предложение\n🔹 `/serverstats` — Статистика сервера\n🔹 `/activitygraph` — График активности по часам\n🔹 `/auditlog <юзер>` — Лог модерации пользователя (модератор)\n🔹 `/modstats [дни]` — Статистика модерации (модератор)"
         await self.update_embed(interaction, "⚙️ Разное", desc, discord.Color.light_grey())
 
 @bot.hybrid_command(name="help", description="Показать список всех команд бота")
@@ -2002,6 +2075,26 @@ async def on_message(message):
         print(f"[XP] {message.author.display_name} получил +1 сообщение. Всего: {new_messages}. Баланс: {new_balance}")
         
         await check_and_award_roles(message.author)
+
+        # Начисление сезонных очков (+1 за сообщение)
+        try:
+            season = load_season()
+            uid = str(message.author.id)
+            season['points'][uid] = season['points'].get(uid, 0) + 1
+            await save_season(season)
+        except Exception:
+            pass
+
+        # Обновление статистики (сообщения по часам)
+        try:
+            stats = load_stats()
+            today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+            hour_key = f"{today}_{datetime.datetime.now(datetime.timezone.utc).hour:02d}"
+            stats.setdefault("messages", {})
+            stats["messages"][hour_key] = stats["messages"].get(hour_key, 0) + 1
+            await save_stats(stats)
+        except Exception:
+            pass
 
     # !!! ОТЛАДКА: Выводит в консоль (терминал) всё, что видит бот !!!
     print(f"[LOG] Сообщение от {message.author}: {message.content}")
@@ -2447,8 +2540,554 @@ async def slap(ctx, member: discord.Member):
     embed.set_image(url="https://media.giphy.com/media/jLeyZWgtwgr2U/giphy.gif")
     await ctx.send(embed=embed)
 
+
+# ==================== MINI-GAMES ====================
+
+@bot.hybrid_command(name="dice", description="Бросить кости (случайное число 1-6)")
+async def dice(ctx, rolls: int = 1):
+    if rolls < 1 or rolls > 10:
+        return await ctx.send("❌ Количество бросков: от 1 до 10.", ephemeral=True)
+    results = [random.randint(1, 6) for _ in range(rolls)]
+    dice_faces = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
+    line = " ".join([dice_faces[r] for r in results])
+    total = sum(results)
+    embed = discord.Embed(title="🎲 Кости", color=discord.Color.green())
+    embed.add_field(name="Результат", value=f"{line}\n**Сумма: {total}**", inline=False)
+    embed.set_footer(text=f"Бросил: {ctx.author.display_name}")
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="rps", description="Камень-ножницы-бумага. Формат: /rps камень")
+async def rps(ctx, choice: str):
+    choice = choice.lower()
+    aliases = {"камень": "камень", "rock": "камень", "ножницы": "ножницы", "scissors": "ножницы", "ножиц": "ножницы",
+               "бумага": "бумага", "paper": "бумага", "бумажк": "бумага"}
+    choice = aliases.get(choice)
+    if not choice:
+        return await ctx.send("❌ Варианты: `камень`, `ножницы`, `бумага`", ephemeral=True)
+
+    bot_choice = random.choice(["камень", "ножницы", "бумага"])
+    emojis = {"камень": "🪨", "ножницы": "✂️", "бумага": "📄"}
+
+    if choice == bot_choice:
+        result = "Ничья!"
+        color = discord.Color.gold()
+    elif (choice == "камень" and bot_choice == "ножницы") or \
+         (choice == "ножницы" and bot_choice == "бумага") or \
+         (choice == "бумага" and bot_choice == "камень"):
+        result = "Вы победили!"
+        color = discord.Color.green()
+    else:
+        result = "Вы проиграли!"
+        color = discord.Color.red()
+
+    embed = discord.Embed(title="🎮 Камень-Ножницы-Бумага", color=color)
+    embed.add_field(name="Вы", value=f"{emojis[choice]} {choice.title()}", inline=True)
+    embed.add_field(name="Бот", value=f"{emojis[bot_choice]} {bot_choice.title()}", inline=True)
+    embed.add_field(name="Итог", value=result, inline=False)
+    await ctx.send(embed=embed)
+
+
+# --- Quiz / Викторина ---
+
+QUIZ_QUESTIONS = [
+    {"q": "Какая планета ближе всего к Солнцу?", "a": ["меркурий"], "hint": "М..."},
+    {"q": "Сколько планет в Солнечной системе?", "a": ["8"], "hint": "Меньше 10"},
+    {"q": "Какой газ занимает ~78% атмосферы Земли?", "a": ["азот"], "hint": "А..."},
+    {"q": "Какой океан самый большой?", "a": ["тихий"], "hint": "Т..."},
+    {"q": "Кто написал 'Войну и мир'?", "a": ["толстой", "толстого", "лев толстой", "leo tolstoy"], "hint": "Т..."},
+    {"q": "Какой металл жидкий при комнатной температуре?", "a": ["ртуть"], "hint": "Р..."},
+    {"q": "Столица Японии?", "a": ["токио"], "hint": "Т..."},
+    {"q": "Сколько костей в теле взрослого человека?", "a": ["206"], "hint": "Больше 200"},
+    {"q": "Какой элемент обозначается символом 'O'?", "a": ["кислород"], "hint": "К..."},
+    {"q": "Кто изобрёл лампочку?", "a": ["эдисон", "томас эдисон"], "hint": "Э..."},
+    {"q": "Какая река длиннейшая в мире?", "a": ["нил", "ніл"], "hint": "Н..."},
+    {"q": "В каком году началась Вторая мировая война?", "a": ["1939"], "hint": "193..."},
+    {"q": "Какой язык программирования создан Гвидо ван Россумом?", "a": ["пайтон", "python"], "hint": "P..."},
+    {"q": "Сколько бит в байте?", "a": ["8"], "hint": "Маленькое число"},
+    {"q": "Как называется наша галактика?", "a": ["молочный путь", "milky way"], "hint": "М... П..."},
+]
+
+class QuizView(discord.ui.View):
+    def __init__(self, question_data, author_id):
+        super().__init__(timeout=60)
+        self.q = question_data
+        self.author_id = author_id
+        self.answered = False
+
+    @discord.ui.button(label="Подсказка", style=discord.ButtonStyle.secondary)
+    async def hint_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Только тот, кто начал игру, может нажимать.", ephemeral=True)
+        await interaction.response.send_message(f"💡 Подсказка: {self.q['hint']}", ephemeral=True)
+
+    @discord.ui.button(label="Завершить", style=discord.ButtonStyle.danger)
+    async def end_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.author_id:
+            return await interaction.response.send_message("Только тот, кто начал игру, может завершить.", ephemeral=True)
+        self.answered = True
+        await interaction.response.edit_message(content=f"Викторина завершена. Ответ: **{self.q['a'][0]}**", view=None)
+
+@bot.hybrid_command(name="quiz", description="Начать викторину (5 вопросов)")
+async def quiz(ctx):
+    await ctx.defer()
+    picked = random.sample(QUIZ_QUESTIONS, min(5, len(QUIZ_QUESTIONS)))
+    score = 0
+    desc_lines = []
+    for i, q in enumerate(picked, 1):
+        view = QuizView(q, ctx.author.id)
+        embed = discord.Embed(title=f"❓ Вопрос {i}/5", description=f"**{q['q']}**", color=discord.Color.blue())
+        embed.set_footer(text="Напишите ответ в чат (60 сек). Кнопка — подсказка.")
+        msg = await ctx.send(embed=embed, view=view)
+
+        def check(m):
+            return m.author.id == ctx.author.id and m.channel == ctx.channel
+
+        try:
+            answer_msg = await bot.wait_for('message', check=check, timeout=60)
+            user_answer = answer_msg.content.lower().strip()
+            if any(a in user_answer for a in q['a']):
+                score += 1
+                desc_lines.append(f"✅ **{i}.** {q['q']} → **{answer_msg.content}** (верно!)")
+            else:
+                desc_lines.append(f"❌ **{i}.** {q['q']} → **{answer_msg.content}** (правильно: {q['a'][0]})")
+        except asyncio.TimeoutError:
+            desc_lines.append(f"⏰ **{i}.** {q['q']} → Время вышло (правильно: {q['a'][0]})")
+        view.answered = True
+
+    result_embed = discord.Embed(title="📊 Результаты викторины", description="\n".join(desc_lines), color=discord.Color.gold())
+    result_embed.add_field(name="Итого", value=f"**{score}/5** правильных ответов")
+    await ctx.send(embed=result_embed)
+
+    # Награда за викторину
+    if score >= 3:
+        user_id = str(ctx.author.id)
+        reward = score * 50
+        user = await database.get_user(user_id)
+        await database.update_user(user_id, balance=user['balance'] + reward)
+        await ctx.send(f"💰 Вы заработали **{reward}** монет за викторину!")
+
+
+# ==================== AUDIT LOGS ====================
+
+@bot.hybrid_command(name="auditlog", description="Показать лог модерации для пользователя")
+@commands.has_permissions(manage_messages=True)
+async def auditlog(ctx, member: discord.Member, limit: int = 10):
+    logs = await database.get_user_moderation_log(str(member.id), limit)
+    if not logs:
+        return await ctx.send(f"📋 Нет записей модерации для {member.mention}.", ephemeral=True)
+
+    action_emojis = {"kick": "👢", "ban": "🔨", "mute": "🔇", "warn": "⚠️"}
+    rows = []
+    for log in logs:
+        dt = datetime.datetime.fromtimestamp(log['timestamp'], tz=datetime.timezone.utc)
+        ts = discord.utils.format_dt(dt, style='R')
+        emoji = action_emojis.get(log['action'], "📝")
+        rows.append(f"{emoji} **{log['action'].upper()}** | {ts}\nПричина: {log['reason'] or '—'}")
+
+    embed = discord.Embed(
+        title=f"📋 Лог модерации: {member.display_name}",
+        description="\n\n".join(rows),
+        color=discord.Color.orange()
+    )
+    await ctx.send(embed=embed, ephemeral=True)
+
+@bot.hybrid_command(name="modstats", description="Статистика модерации за последние N дней")
+@commands.has_permissions(manage_messages=True)
+async def modstats(ctx, days: int = 7):
+    all_users = await database.get_all_users()
+    mod_count = 0
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    if not log_channel:
+        return await ctx.send("Канал логов не настроен.", ephemeral=True)
+
+    async for entry in log_channel.history(limit=500, after=datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)):
+        if entry.embeds:
+            title = entry.embeds[0].title or ""
+            if any(k in title for k in ["Мут", "Кик", "Бан", "Варн", "мут", "кик", "бан", "варн"]):
+                mod_count += 1
+
+    embed = discord.Embed(title=f"📊 Модерация за {days} дн.", color=discord.Color.orange())
+    embed.add_field(name="Событий в логах", value=str(mod_count), inline=True)
+    await ctx.send(embed=embed, ephemeral=True)
+
+
+# ==================== SERVER STATISTICS ====================
+
+STATS_FILE = "server_stats.json"
+
+def load_stats():
+    try:
+        with open(STATS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"messages": {}, "voice": {}, "joins": 0, "leaves": 0}
+
+async def save_stats(data):
+    try:
+        def _write():
+            with open(STATS_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(_write)
+    except Exception as e:
+        print(f"[ERROR] save_stats: {e}")
+
+@bot.hybrid_command(name="serverstats", description="Показать статистику сервера")
+async def serverstats(ctx):
+    stats = load_stats()
+    msg_data = stats.get("messages", {})
+    voice_data = stats.get("voice", {})
+
+    total_messages = sum(msg_data.values())
+    total_voice = sum(voice_data.values())
+
+    # Топ-5 дней по активности
+    top_days = sorted(msg_data.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_lines = [f"**{d}**: {c} сообщ." for d, c in top_days]
+
+    embed = discord.Embed(title="📊 Статистика сервера", color=discord.Color.blue())
+    embed.add_field(name="💬 Всего сообщений (7 дн.)", value=str(total_messages), inline=True)
+    embed.add_field(name="🎙️ Всего в войсе (7 дн.)", value=f"{total_voice:.0f} мин.", inline=True)
+    embed.add_field(name="📥 Входов", value=str(stats.get("joins", 0)), inline=True)
+    embed.add_field(name="📤 Выходов", value=str(stats.get("leaves", 0)), inline=True)
+    if top_lines:
+        embed.add_field(name="📈 Самые активные дни", value="\n".join(top_lines), inline=False)
+    embed.set_footer(text="Данные за последние 7 дней")
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="activitygraph", description="График активности по часам за сегодня")
+async def activitygraph(ctx):
+    stats = load_stats()
+    today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    hour_data = {}
+    for h in range(24):
+        key = f"{today}_{h:02d}"
+        hour_data[h] = stats.get("messages", {}).get(key, 0)
+
+    max_val = max(hour_data.values()) if hour_data.values() else 1
+    bar_chars = ["░", "▒", "▓", "█"]
+    lines = []
+    for h in range(24):
+        val = hour_data.get(h, 0)
+        bar_len = int((val / max_val) * 12) if max_val > 0 else 0
+        bar = "█" * bar_len + "░" * (12 - bar_len)
+        lines.append(f"`{h:02d}` {bar} {val}")
+
+    embed = discord.Embed(
+        title=f"📈 Активность за {today}",
+        description="```\n" + "\n".join(lines) + "\n```",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Каждый час = сообщения")
+    await ctx.send(embed=embed)
+
+async def stats_tracker_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            stats = load_stats()
+            now = datetime.datetime.now(datetime.timezone.utc)
+            today = now.strftime("%Y-%m-%d")
+
+            # Очистка данных старше 7 дней
+            cutoff = (now - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+            stats["messages"] = {k: v for k, v in stats.get("messages", {}).items() if k[:10] >= cutoff}
+            stats["voice"] = {k: v for k, v in stats.get("voice", {}).items() if k[:10] >= cutoff}
+
+            await save_stats(stats)
+        except Exception as e:
+            print(f"[stats_loop] error: {e}")
+        await asyncio.sleep(3600)
+
+
+# ==================== GIVEAWAY ====================
+
+GIVEAWAY_FILE = "giveaways.json"
+
+def load_giveaways():
+    try:
+        with open(GIVEAWAY_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+async def save_giveaways(data):
+    try:
+        def _write():
+            with open(GIVEAWAY_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(_write)
+    except Exception as e:
+        print(f"[ERROR] save_giveaways: {e}")
+
+class GiveawayView(discord.ui.View):
+    def __init__(self, giveaway_id: str):
+        super().__init__(timeout=None)
+        self.giveaway_id = giveaway_id
+
+    @discord.ui.button(label="🎉 Участвовать!", style=discord.ButtonStyle.success, custom_id="giveaway_join")
+    async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        giveaways = load_giveaways()
+        g = next((g for g in giveaways if g['id'] == self.giveaway_id), None)
+        if not g:
+            return await interaction.response.send_message("Розыгрыш уже завершён.", ephemeral=True)
+
+        user_id = str(interaction.user.id)
+        participants = g.get('participants', [])
+        if user_id in participants:
+            participants.remove(user_id)
+            await interaction.response.send_message("❌ Вы вышли из розыгрыша.", ephemeral=True)
+        else:
+            participants.append(user_id)
+            g['participants'] = participants
+            await save_giveaways(giveaways)
+            await interaction.response.send_message(f"✅ Вы участвуете! Участников: **{len(participants)}**", ephemeral=True)
+
+@bot.hybrid_command(name="giveaway", description="Создать розыгрыш. Формат: /giveaway 1h Приз")
+@commands.has_permissions(manage_guild=True)
+async def giveaway(ctx, duration: str, *, prize: str):
+    td = parse_time_delta(duration) if 'parse_time_delta' in dir() else None
+    if not td:
+        total_seconds = 0
+        pattern = re.compile(r'(\d+)\s*(s|sec|m|min|h|ч|д|d)', re.IGNORECASE)
+        matches = pattern.findall(duration)
+        for val, unit in matches:
+            val = int(val)
+            unit = unit.lower()
+            if unit in ('s', 'sec'): total_seconds += val
+            elif unit in ('m', 'min'): total_seconds += val * 60
+            elif unit in ('h', 'ч'): total_seconds += val * 3600
+            elif unit in ('d', 'д'): total_seconds += val * 86400
+        if total_seconds <= 0:
+            return await ctx.send("❌ Формат времени: `1h`, `30m`, `2d`", ephemeral=True)
+        td = datetime.timedelta(seconds=total_seconds)
+
+    if td.total_seconds() < 60:
+        return await ctx.send("❌ Минимальное время — 1 минута.", ephemeral=True)
+
+    giveaways = load_giveaways()
+    giveaway_id = uuid.uuid4().hex[:10]
+    now = datetime.datetime.now(datetime.timezone.utc)
+    end_at = now + td
+
+    giveaway_data = {
+        "id": giveaway_id,
+        "prize": prize,
+        "channel_id": ctx.channel.id,
+        "author_id": str(ctx.author.id),
+        "end_at": end_at.isoformat(),
+        "participants": [],
+        "winner_id": None
+    }
+    giveaways.append(giveaway_data)
+    await save_giveaways(giveaways)
+
+    embed = discord.Embed(title="🎉 РОЗЫГРЫШ!", description=f"**Приз:** {prize}\n\nНажмите кнопку ниже, чтобы участвовать!", color=discord.Color.gold())
+    embed.add_field(name="Окончание", value=discord.utils.format_dt(end_at, style='R'), inline=True)
+    embed.add_field(name="Создал", value=ctx.author.mention, inline=True)
+    embed.set_footer(text=f"ID: {giveaway_id}")
+    await ctx.send(embed=embed, view=GiveawayView(giveaway_id))
+
+@bot.hybrid_command(name="giveaway_end", description="Завершить розыгрыш досрочно и выбрать победителя")
+@commands.has_permissions(manage_guild=True)
+async def giveaway_end(ctx, giveaway_id: str):
+    giveaways = load_giveaways()
+    g = next((g for g in giveaways if g['id'] == giveaway_id), None)
+    if not g:
+        return await ctx.send("❌ Розыгрыш не найден.", ephemeral=True)
+    if g.get('winner_id'):
+        return await ctx.send("❌ Розыгрыш уже завершён.", ephemeral=True)
+
+    participants = g.get('participants', [])
+    if not participants:
+        await ctx.send("❌ Никто не участвовал в розыгрыше.")
+        g['winner_id'] = "none"
+        await save_giveaways(giveaways)
+        return
+
+    winner_id = random.choice(participants)
+    g['winner_id'] = winner_id
+    await save_giveaways(giveaways)
+
+    try:
+        winner = await ctx.guild.fetch_member(int(winner_id))
+        winner_mention = winner.mention
+    except Exception:
+        winner_mention = f"<@{winner_id}>"
+
+    embed = discord.Embed(title="🎉 Розыгрыш завершён!", color=discord.Color.gold())
+    embed.add_field(name="Приз", value=g['prize'], inline=False)
+    embed.add_field(name="Победитель", value=winner_mention, inline=True)
+    embed.add_field(name="Участников", value=str(len(participants)), inline=True)
+    await ctx.send(embed=embed)
+
+async def giveaway_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            giveaways = load_giveaways()
+            now = datetime.datetime.now(datetime.timezone.utc)
+            changed = False
+            for g in giveaways:
+                if g.get('winner_id'):
+                    continue
+                try:
+                    end_dt = datetime.datetime.fromisoformat(g['end_at'])
+                    if end_dt.tzinfo is None:
+                        end_dt = end_dt.replace(tzinfo=datetime.timezone.utc)
+                    if end_dt <= now:
+                        participants = g.get('participants', [])
+                        if participants:
+                            winner_id = random.choice(participants)
+                            g['winner_id'] = winner_id
+                            changed = True
+                            try:
+                                channel = bot.get_channel(g['channel_id'])
+                                if channel:
+                                    try:
+                                        winner = await channel.guild.fetch_member(int(winner_id))
+                                        winner_mention = winner.mention
+                                    except Exception:
+                                        winner_mention = f"<@{winner_id}>"
+                                    embed = discord.Embed(title="🎉 Розыгрыш завершён!", color=discord.Color.gold())
+                                    embed.add_field(name="Приз", value=g['prize'], inline=False)
+                                    embed.add_field(name="Победитель", value=winner_mention, inline=True)
+                                    embed.add_field(name="Участников", value=str(len(participants)), inline=True)
+                                    await channel.send(embed=embed)
+                            except Exception as e:
+                                print(f"[giveaway_loop] send error: {e}")
+                        else:
+                            g['winner_id'] = "none"
+                            changed = True
+                except Exception:
+                    continue
+            if changed:
+                await save_giveaways(giveaways)
+        except Exception as e:
+            print(f"[giveaway_loop] error: {e}")
+        await asyncio.sleep(30)
+
+
+# ==================== SEASON SYSTEM ====================
+
+SEASON_FILE = "season_data.json"
+
+def load_season():
+    try:
+        with open(SEASON_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {"season_number": 1, "start_date": "", "points": {}}
+
+async def save_season(data):
+    try:
+        def _write():
+            with open(SEASON_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        await asyncio.to_thread(_write)
+    except Exception as e:
+        print(f"[ERROR] save_season: {e}")
+
+@bot.hybrid_command(name="season_start", description="Начать новый сезон (админ)")
+@commands.has_permissions(administrator=True)
+async def season_start(ctx):
+    season = load_season()
+    season['season_number'] += 1
+    season['start_date'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    season['points'] = {}
+    await save_season(season)
+
+    embed = discord.Embed(
+        title=f"🏆 Сезон {season['season_number']} начат!",
+        description="Очки начисляются автоматически:\n"
+                    "• Сообщение = +1 очко\n"
+                    "• 10 минут в войсе = +5 очков\n"
+                    "• Выполненный крафт = +10 очков\n"
+                    "• Победа в викторине = +20 очков",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
+
+@bot.hybrid_command(name="season_end", description="Завершить сезон и объявить победителя (админ)")
+@commands.has_permissions(administrator=True)
+async def season_end(ctx):
+    season = load_season()
+    if not season['points']:
+        return await ctx.send("В этом сезоне никто не набрал очков.", ephemeral=True)
+
+    sorted_users = sorted(season['points'].items(), key=lambda x: x[1], reverse=True)
+    top3 = sorted_users[:3]
+    medals = ["🥇", "🥈", "🥉"]
+
+    desc_lines = []
+    for i, (uid, pts) in enumerate(top3):
+        try:
+            member = await ctx.guild.fetch_member(int(uid))
+            name = member.display_name
+        except Exception:
+            name = f"ID:{uid}"
+        desc_lines.append(f"{medals[i]} **{name}** — {pts} очков")
+
+    embed = discord.Embed(
+        title=f"🏆 Сезон {season['season_number']} завершён!",
+        description="\n".join(desc_lines) if desc_lines else "Нет участников.",
+        color=discord.Color.gold()
+    )
+    await ctx.send(embed=embed)
+
+    # Сброс очков
+    season['points'] = {}
+    await save_season(season)
+
+@bot.hybrid_command(name="season_top", description="Таблица лидеров текущего сезона")
+async def season_top(ctx):
+    season = load_season()
+    if not season['points']:
+        return await ctx.send("В этом сезоне пока нет очков.", ephemeral=True)
+
+    sorted_users = sorted(season['points'].items(), key=lambda x: x[1], reverse=True)[:15]
+    medals = ["🥇", "🥈", "🥉"] + [f"{i+1}." for i in range(3, 15)]
+
+    rows = []
+    for i, (uid, pts) in enumerate(sorted_users):
+        try:
+            member = ctx.guild.get_member(int(uid))
+            name = member.display_name if member else f"ID:{uid}"
+        except Exception:
+            name = f"ID:{uid}"
+        rows.append((medals[i], name, str(pts)))
+
+    headers = ["#", "Участник", "Очки"]
+    paginator = TablePaginator(ctx, f"🏆 Топ сезона {season['season_number']}", headers, rows, page_size=8, color=discord.Color.gold())
+    embed = paginator._get_page_embed()
+    await ctx.send(embed=embed, view=paginator)
+
+@bot.hybrid_command(name="season_rank", description="Показать ваше место в сезоне")
+async def season_rank(ctx, member: discord.Member = None):
+    member = member or ctx.author
+    season = load_season()
+    uid = str(member.id)
+    pts = season['points'].get(uid, 0)
+    sorted_users = sorted(season['points'].items(), key=lambda x: x[1], reverse=True)
+    place = next((i+1 for i, (k, _) in enumerate(sorted_users) if k == uid), None)
+
+    embed = discord.Embed(title=f"🏆 Сезон {season['season_number']}: {member.display_name}", color=discord.Color.gold())
+    embed.add_field(name="Очки", value=str(pts), inline=True)
+    embed.add_field(name="Место", value=f"#{place}" if place else "Не в таблице", inline=True)
+    await ctx.send(embed=embed)
+
+# Начисление очков сезона в on_message (вызывается из on_message ниже)
+# Начисление за войс — в on_voice_state_update
+
 @bot.event
 async def on_member_join(member):
+    # Статистика входов
+    try:
+        stats = load_stats()
+        stats['joins'] = stats.get('joins', 0) + 1
+        await save_stats(stats)
+    except Exception:
+        pass
+
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         embed = discord.Embed(title="📥 Участник присоединился", color=discord.Color.green())
@@ -2461,6 +3100,14 @@ async def on_member_join(member):
 
 @bot.event
 async def on_member_remove(member):
+    # Статистика выходов
+    try:
+        stats = load_stats()
+        stats['leaves'] = stats.get('leaves', 0) + 1
+        await save_stats(stats)
+    except Exception:
+        pass
+
     log_channel = bot.get_channel(LOG_CHANNEL_ID)
     if log_channel:
         embed = discord.Embed(title="📤 Участник вышел", color=discord.Color.red())
