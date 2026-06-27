@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+bot_database.db
+users_data.json
+marketplace.json

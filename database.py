@@ -38,6 +38,20 @@ async def init_db():
         await db.execute('INSERT OR IGNORE INTO server_data (key, value) VALUES (?, ?)', ("jackpot", 1000))
         await db.commit()
         
+        # Таблица логов модерации
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS moderation_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                moderator_id TEXT,
+                action TEXT NOT NULL,
+                reason TEXT DEFAULT '',
+                details TEXT DEFAULT '',
+                timestamp REAL NOT NULL
+            )
+        ''')
+        await db.commit()
+        
         # Безопасное добавление новых колонок в существующую базу (чтобы старая не сломалась)
         try:
             await db.execute('ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0')
@@ -104,3 +118,23 @@ async def update_server_data(key: str, value: int):
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute('INSERT OR REPLACE INTO server_data (key, value) VALUES (?, ?)', (key, value))
         await db.commit()
+
+async def log_moderation(user_id: str, moderator_id: str, action: str, reason: str = "", details: str = ""):
+    """Записать событие модерации в лог"""
+    import time as _time
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            'INSERT INTO moderation_log (user_id, moderator_id, action, reason, details, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+            (user_id, moderator_id, action, reason, details, _time.time())
+        )
+        await db.commit()
+
+async def get_user_moderation_log(user_id: str, limit: int = 50):
+    """Получить лог модерации для пользователя (новые сверху)"""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            'SELECT * FROM moderation_log WHERE user_id = ? ORDER BY timestamp DESC LIMIT ?',
+            (user_id, limit)
+        ) as cursor:
+            return await cursor.fetchall()

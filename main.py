@@ -37,21 +37,20 @@ spam_warnings = {}
 spam_tracker = {}
 music_queues = {}
 
-# 3. Настройки и ID каналов
-LOG_CHANNEL_ID = 1500133161173254196
-TICKET_CATEGORY_ID = 1500197078217789440
-WHITELISTED_USERS = ["gs_uzbekovi4"]
-our_server_invite = "https://discord.gg/ur5tPZ7umw"
+# 3. Настройки и ID каналов (Замените на свои настоящие ID!)
+LOG_CHANNEL_ID = 123456789012345678
+TICKET_CATEGORY_ID = 123456789012345678
+WHITELISTED_USERS = ["zabiv"]
+our_server_invite = "discord.gg/"
 cached_server_context = "Ты крутой бот-помощник."
 
-LEVEL_ROLES = {"хороший участник": 1500210317140037702}
+LEVEL_ROLES = {"хороший участник": 666666666666666666}
 ROLE_REQUIREMENTS = {"хороший участник": {"messages": 100, "voice_hours": 10.0}}
-
 # Магазин: ключ = item_id. Для предметов указываем type="item", для ролей type="role" и role_id
 SHOP_ITEMS = {
-    "vip": {"name": "VIP", "price": 1000, "type": "role", "role_id": 1506636782614220920},
-    "pizza": {"name": "Пицца 🍕", "price": 150, "type": "role", "role_id": 1506636616947466300},
-    "color": {"name": "", "price": 500, "type": "item"},
+    "vip": {"name": "VIP", "price": 1000, "type": "role", "role_id": 666666666666666666},
+    "pizza": {"name": "Пицца 🍕", "price": 150, "type": "item"},
+    "color": {"name": "Цветной ник", "price": 500, "type": "item"},
     "lockpick": {"name": "Отмычка 🔓", "price": 300, "type": "item"},
     # Недвижимость / источники пассивного дохода
     "house_small": {"name": "Маленький дом 🏠", "price": 5000, "type": "property", "income": 50},
@@ -61,6 +60,7 @@ SHOP_ITEMS = {
     # Лутбокс — при покупке сразу даёт случайный предмет/монеты
     "lootbox": {"name": "Лутбокс 🎁", "price": 500, "type": "lootbox"}
 }
+
 # Локальное хранилище инвентарей/допол. данных (оставлено для совместимости)
 users_data = {}
 USERS_DATA_FILE = "users_data.json"
@@ -358,8 +358,8 @@ async def on_presence_update(before, after):
         
     good_member_role_id = LEVEL_ROLES.get("хороший участник")
     
-# Проверяем, настроена ли роль
-    if not good_member_role_id:
+    # Проверяем, настроена ли роль
+    if not good_member_role_id or good_member_role_id == 666666666666666666:
         return
 
     good_member_role = after.guild.get_role(good_member_role_id)
@@ -595,6 +595,7 @@ async def kick(ctx, member: discord.Member, *, reason: str = "Не указан�
     try:
         await member.kick(reason=reason)
         await ctx.send(f'✅ {member.mention} был выгнан. Причина: {reason}')
+        await database.log_moderation(str(member.id), str(ctx.author.id), "kick", reason)
 
         log_channel = bot.get_channel(LOG_CHANNEL_ID)
         if log_channel:
@@ -763,7 +764,7 @@ async def rep(ctx, member: discord.Member):
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     if giver_id not in users_data:
-        users_data[giver_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'balance': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
+        users_data[giver_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
 
     last_rep_ts = users_data[giver_id].get('last_rep_ts', 0)
 
@@ -775,7 +776,7 @@ async def rep(ctx, member: discord.Member):
         return
 
     if target_id not in users_data:
-        users_data[target_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'balance': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
+        users_data[target_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
 
     users_data[target_id]['reputation'] = users_data[target_id].get('reputation', 0) + 1
     users_data[giver_id]['last_rep_ts'] = now_ts
@@ -799,7 +800,7 @@ async def unrep(ctx, member: discord.Member):
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
     if giver_id not in users_data:
-        users_data[giver_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'balance': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
+        users_data[giver_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
 
     last_rep_ts = users_data[giver_id].get('last_rep_ts', 0)
 
@@ -811,7 +812,7 @@ async def unrep(ctx, member: discord.Member):
         return
 
     if target_id not in users_data:
-        users_data[target_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'balance': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
+        users_data[target_id] = {'messages': 0, 'voice_seconds': 0, 'last_message_ts': 0, 'last_work_ts': 0, 'reputation': 0, 'last_rep_ts': 0}
 
     users_data[target_id]['reputation'] = users_data[target_id].get('reputation', 0) - 1
     users_data[giver_id]['last_rep_ts'] = now_ts
@@ -2304,29 +2305,26 @@ async def on_message(message):
 async def daily(ctx):
     user_id = str(ctx.author.id)
     now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
-    
-    users_data.setdefault(user_id, {})
-    user_stats = users_data[user_id]
-    
-    last_daily = user_stats.get('last_daily_ts', 0)
-    streak = user_stats.get('daily_streak', 0)
+
+    user = await database.get_user(user_id)
+
+    last_daily = user['last_daily_ts']
+    streak = user['daily_streak']
     time_since_last = now_ts - last_daily
-    
+
     if time_since_last < 86400: # 24 часа
         rem = int(86400 - time_since_last)
         return await ctx.send(f"⏳ Бонус будет доступен через **{rem // 3600} ч. {rem % 3600 // 60} мин.**", ephemeral=True)
-        
+
     if time_since_last > 172800: # Сброс стрика если прошло больше 48 часов
         streak = 0
-        
+
     streak += 1
     reward = min(100 + (streak * 20), 500) # База 100, +20 за стрик, макс 500
-    
-    user_stats['balance'] = user_stats.get('balance', 0) + reward
-    user_stats['last_daily_ts'] = now_ts
-    user_stats['daily_streak'] = streak
-    await save_user_data(users_data)
-    
+
+    new_balance = user['balance'] + reward
+    await database.update_user(user_id, balance=new_balance, last_daily_ts=now_ts, daily_streak=streak)
+
     embed = discord.Embed(title="🎁 Ежедневный бонус", color=discord.Color.green())
     embed.add_field(name="Получено", value=f"**{reward}** монет")
     embed.add_field(name="Стрик", value=f"🔥 **{streak}** дней подряд")
