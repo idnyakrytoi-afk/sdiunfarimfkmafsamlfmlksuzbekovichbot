@@ -1,10 +1,12 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, Response
+from flask import Flask, render_template, request, redirect, url_for, flash, Response, g, session
 import os
 import json
 from functools import wraps
 import io
 import asyncio
 import secrets
+import hashlib
+from json_state import JSON_LOCK, write_json
 
 
 def token_auth_required():
@@ -14,15 +16,20 @@ def token_auth_required():
             token = os.environ.get('DASH_TOKEN')
             if not token:
                 return Response('DASH_TOKEN is not configured', 503)
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            if request.method == 'GET' and session.get('dashboard_token_digest') == digest:
+                return f(*args, **kwargs)
             # prefer Authorization header `Bearer <token>`
             auth_hdr = request.headers.get('Authorization', '')
             if auth_hdr.startswith('Bearer '):
                 given = auth_hdr.split(' ', 1)[1]
                 if secrets.compare_digest(given, token):
+                    session['dashboard_token_digest'] = digest
                     return f(*args, **kwargs)
             # allow token via form for browser POSTs
             given_form = request.form.get('token') or request.args.get('token')
             if given_form is not None and secrets.compare_digest(given_form, token):
+                session['dashboard_token_digest'] = digest
                 return f(*args, **kwargs)
             return Response('Unauthorized', 401)
         return wrapped
@@ -31,8 +38,20 @@ def token_auth_required():
 
 def create_app(bot=None):
     app = Flask(__name__)
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
     app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
     app.secret_key = os.environ.get('FLASK_SECRET') or secrets.token_hex(32)
+
+    @app.before_request
+    def lock_state():
+        JSON_LOCK.acquire()
+        g.state_locked = True
+
+    @app.teardown_request
+    def unlock_state(error):
+        if getattr(g, 'state_locked', False):
+            g.state_locked = False
+            JSON_LOCK.release()
 
     @app.route('/')
     @token_auth_required()
@@ -115,14 +134,15 @@ def create_app(bot=None):
             flash('Missing fields', 'error')
             return redirect(url_for('index'))
         try:
+            import datetime
+            datetime.datetime.fromisoformat(iso)
             try:
                 with open('scheduled.json', 'r', encoding='utf-8') as f:
                     scheduled = json.load(f)
             except FileNotFoundError:
                 scheduled = []
             scheduled.append({'datetime': iso, 'message': message, 'channel_id': int(channel_id)})
-            with open('scheduled.json', 'w', encoding='utf-8') as f:
-                json.dump(scheduled, f, ensure_ascii=False, indent=2)
+            write_json('scheduled.json', scheduled)
             flash('Scheduled', 'success')
         except Exception as e:
             flash(f'Error: {e}', 'error')
@@ -145,8 +165,7 @@ def create_app(bot=None):
             feeds = cfg.get('feeds', [])
             feeds.append({'url': url, 'channel_id': int(channel_id)})
             cfg['feeds'] = feeds
-            with open('server_data.json', 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            write_json('server_data.json', cfg)
             flash('Feed added', 'success')
         except Exception as e:
             flash(f'Error: {e}', 'error')
@@ -168,8 +187,7 @@ def create_app(bot=None):
             feeds = cfg.get('feeds', [])
             feeds = [f for f in feeds if f.get('url') != url]
             cfg['feeds'] = feeds
-            with open('server_data.json', 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            write_json('server_data.json', cfg)
             flash('Feed removed', 'success')
         except Exception as e:
             flash(f'Error: {e}', 'error')
@@ -191,8 +209,7 @@ def create_app(bot=None):
                 scheduled = []
             if 0 <= idx < len(scheduled):
                 scheduled.pop(idx)
-                with open('scheduled.json', 'w', encoding='utf-8') as f:
-                    json.dump(scheduled, f, ensure_ascii=False, indent=2)
+                write_json('scheduled.json', scheduled)
                 flash('Scheduled item removed', 'success')
             else:
                 flash('Index out of range', 'error')

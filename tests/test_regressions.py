@@ -85,3 +85,40 @@ class PersistentViewsTests(unittest.IsolatedAsyncioTestCase):
     async def test_ticket_button_is_persistent(self):
         import main
         self.assertTrue(main.TicketView().is_persistent())
+
+
+class StateTests(unittest.TestCase):
+    def test_concurrent_updates_keep_all_items(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from json_state import JSON_LOCK, read_json, write_json
+        with tempfile.TemporaryDirectory() as directory:
+            filename = str(Path(directory) / 'items.json')
+            def append(number):
+                with JSON_LOCK:
+                    items = read_json(filename, [])
+                    items.append(number)
+                    write_json(filename, items)
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                list(pool.map(append, range(20)))
+            self.assertEqual(sorted(read_json(filename, [])), list(range(20)))
+
+    def test_form_redirect_keeps_read_auth_and_rejects_unauthenticated_writes(self):
+        from contextlib import chdir
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            with patch.dict(os.environ, {'DASH_TOKEN': 'test-secret'}):
+                client = create_app().test_client()
+                result = client.post('/schedule', data={
+                    'token': 'test-secret', 'datetime': '2030-01-01T00:00:00',
+                    'message': 'test', 'channel_id': '123',
+                }, follow_redirects=True)
+                self.assertEqual(result.status_code, 200)
+                self.assertEqual(client.post('/schedule/delete', data={'index': '0'}).status_code, 401)
+
+    def test_invalid_schedule_is_not_written(self):
+        from contextlib import chdir
+        with tempfile.TemporaryDirectory() as directory, chdir(directory):
+            with patch.dict(os.environ, {'DASH_TOKEN': 'test-secret'}):
+                client = create_app().test_client()
+                client.post('/schedule', data={'token': 'test-secret', 'datetime': 'invalid',
+                    'message': 'test', 'channel_id': '123'})
+                self.assertFalse(Path('scheduled.json').exists())

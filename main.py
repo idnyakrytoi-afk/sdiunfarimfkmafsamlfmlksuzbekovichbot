@@ -17,6 +17,8 @@ import time
 from web import create_app
 import xml.etree.ElementTree as ET
 
+from json_state import JSON_LOCK, read_json, write_json
+
 import database # Импортируем наш новый модуль
 
 load_dotenv() # Загружаем переменные из .env файла
@@ -215,33 +217,28 @@ async def scheduler_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            try:
-                with open('scheduled.json', 'r', encoding='utf-8') as f:
-                    scheduled = json.load(f)
-            except FileNotFoundError:
-                scheduled = []
-
+            scheduled = read_json('scheduled.json', [])
             now = datetime.datetime.now(datetime.timezone.utc)
-            remaining = []
+            delivered = []
             for item in scheduled:
                 try:
                     dt = datetime.datetime.fromisoformat(item['datetime'])
-                    # if naive, assume UTC
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=datetime.timezone.utc)
                     if dt <= now:
                         ch = bot.get_channel(int(item['channel_id']))
                         if ch:
                             await ch.send(item['message'])
-                    else:
-                        remaining.append(item)
-                except Exception:
-                    # malformed entry -> skip
-                    continue
-
-            # rewrite file with remaining items
-            with open('scheduled.json', 'w', encoding='utf-8') as f:
-                json.dump(remaining, f, ensure_ascii=False, indent=2)
+                            delivered.append(item)
+                except Exception as error:
+                    print(f"[scheduler] item retained for retry: {error}")
+            with JSON_LOCK:
+                # Preserve items appended by the dashboard during network requests.
+                current = read_json('scheduled.json', [])
+                for item in delivered:
+                    if item in current:
+                        current.remove(item)
+                write_json('scheduled.json', current)
         except Exception as e:
             print(f"[scheduler] error: {e}")
         await asyncio.sleep(30)
@@ -252,11 +249,7 @@ async def feed_poller_loop():
     POLL_INTERVAL = int(os.environ.get('FEED_POLL_INTERVAL', 120))  # seconds
     while not bot.is_closed():
         try:
-            try:
-                with open('server_data.json', 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-            except FileNotFoundError:
-                cfg = {}
+            cfg = read_json('server_data.json', {})
 
             feeds = cfg.get('feeds', [])
             state = cfg.get('feeds_state', {})
@@ -307,14 +300,15 @@ async def feed_poller_loop():
                                     else:
                                         link = f"https://youtu.be/{vid}"
                                     await ch.send(f"Новое видео: {link}")
-                                state[url] = vid
+                                    state[url] = vid
                     except Exception:
                         # per-feed error (request/parse) — skip this feed
                         continue
 
-            cfg['feeds_state'] = state
-            with open('server_data.json', 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            with JSON_LOCK:
+                current = read_json('server_data.json', {})
+                current.setdefault('feeds_state', {}).update(state)
+                write_json('server_data.json', current)
         except Exception as e:
             print(f"[feed_poller] error: {e}")
         await asyncio.sleep(POLL_INTERVAL)
