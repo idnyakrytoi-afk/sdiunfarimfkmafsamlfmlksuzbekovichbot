@@ -3,6 +3,8 @@ import os
 import json
 from functools import wraps
 import io
+import asyncio
+import secrets
 
 
 def token_auth_required():
@@ -11,17 +13,16 @@ def token_auth_required():
         def wrapped(*args, **kwargs):
             token = os.environ.get('DASH_TOKEN')
             if not token:
-                # no token configured -> allow access
-                return f(*args, **kwargs)
+                return Response('DASH_TOKEN is not configured', 503)
             # prefer Authorization header `Bearer <token>`
             auth_hdr = request.headers.get('Authorization', '')
             if auth_hdr.startswith('Bearer '):
                 given = auth_hdr.split(' ', 1)[1]
-                if given == token:
+                if secrets.compare_digest(given, token):
                     return f(*args, **kwargs)
             # allow token via form for browser POSTs
             given_form = request.form.get('token') or request.args.get('token')
-            if given_form == token:
+            if given_form is not None and secrets.compare_digest(given_form, token):
                 return f(*args, **kwargs)
             return Response('Unauthorized', 401)
         return wrapped
@@ -30,7 +31,8 @@ def token_auth_required():
 
 def create_app(bot=None):
     app = Flask(__name__)
-    app.secret_key = os.environ.get('FLASK_SECRET', 'change-me')
+    app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024
+    app.secret_key = os.environ.get('FLASK_SECRET') or secrets.token_hex(32)
 
     @app.route('/')
     @token_auth_required()
@@ -68,7 +70,7 @@ def create_app(bot=None):
             if not ch:
                 flash('Channel not found', 'error')
                 return redirect(url_for('index'))
-            bot.loop.create_task(ch.send(content))
+            asyncio.run_coroutine_threadsafe(ch.send(content), bot.loop)
             flash('Notification queued', 'success')
         except Exception as e:
             flash(f'Error: {e}', 'error')
@@ -96,7 +98,7 @@ def create_app(bot=None):
                 from discord import File
                 fp = io.BytesIO(data)
                 await ch.send(content=message, file=File(fp, filename=filename))
-            bot.loop.create_task(_send())
+            asyncio.run_coroutine_threadsafe(_send(), bot.loop)
             flash('Clip upload queued', 'success')
         except Exception as e:
             flash(f'Error: {e}', 'error')
@@ -125,8 +127,6 @@ def create_app(bot=None):
         except Exception as e:
             flash(f'Error: {e}', 'error')
         return redirect(url_for('index'))
-
-    return app
 
     @app.route('/feeds/add', methods=['POST'])
     @token_auth_required()
@@ -199,3 +199,5 @@ def create_app(bot=None):
         except Exception as e:
             flash(f'Error: {e}', 'error')
         return redirect(url_for('index'))
+
+    return app
