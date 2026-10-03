@@ -52,15 +52,22 @@ async def init_db():
         ''')
         await db.commit()
         
-        # Безопасное добавление новых колонок в существующую базу (чтобы старая не сломалась)
-        try:
-            await db.execute('ALTER TABLE users ADD COLUMN bank INTEGER DEFAULT 0')
-            await db.execute('ALTER TABLE users ADD COLUMN last_crime_ts REAL DEFAULT 0.0')
-            await db.execute('ALTER TABLE users ADD COLUMN last_rob_ts REAL DEFAULT 0.0')
-            await db.execute('ALTER TABLE users ADD COLUMN season_points INTEGER DEFAULT 0')
-            await db.commit()
-        except Exception:
-            pass # Если колонки уже существуют, просто игнорируем ошибку
+        # Inspect columns individually so one existing column cannot skip later migrations.
+        async with db.execute('PRAGMA table_info(users)') as cursor:
+            existing = {row[1] for row in await cursor.fetchall()}
+        columns = {
+            'messages': 'INTEGER DEFAULT 0', 'voice_seconds': 'REAL DEFAULT 0.0',
+            'last_message_ts': 'REAL DEFAULT 0.0', 'name': 'TEXT', 'avatar': 'TEXT',
+            'balance': 'INTEGER DEFAULT 0', 'bank': 'INTEGER DEFAULT 0',
+            'last_work_ts': 'REAL DEFAULT 0.0', 'last_crime_ts': 'REAL DEFAULT 0.0',
+            'last_rob_ts': 'REAL DEFAULT 0.0', 'season_points': 'INTEGER DEFAULT 0',
+            'reputation': 'INTEGER DEFAULT 0', 'last_rep_ts': 'REAL DEFAULT 0.0',
+            'last_daily_ts': 'REAL DEFAULT 0.0', 'daily_streak': 'INTEGER DEFAULT 0',
+        }
+        for name, definition in columns.items():
+            if name not in existing:
+                await db.execute(f'ALTER TABLE users ADD COLUMN {name} {definition}')
+        await db.commit()
 
 async def get_all_users():
     """Вернуть всех пользователей (list of rows)"""
@@ -77,7 +84,7 @@ async def get_user(user_id: str):
             row = await cursor.fetchone()
             if row is None:
                 # Если юзера нет, создаем его
-                await db.execute('INSERT INTO users (user_id) VALUES (?)', (user_id,))
+                await db.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
                 await db.commit()
                 async with db.execute('SELECT * FROM users WHERE user_id = ?', (user_id,)) as new_cursor:
                     return await new_cursor.fetchone()
@@ -88,6 +95,11 @@ async def update_user(user_id: str, **kwargs):
     if not kwargs:
         return
         
+    allowed = {'messages', 'voice_seconds', 'last_message_ts', 'name', 'avatar',
+               'balance', 'bank', 'last_work_ts', 'last_crime_ts', 'last_rob_ts',
+               'season_points', 'reputation', 'last_rep_ts', 'last_daily_ts', 'daily_streak'}
+    if not kwargs.keys() <= allowed:
+        raise ValueError("Unknown user field")
     set_clause = ", ".join([f"{k} = ?" for k in kwargs.keys()])
     values = tuple(kwargs.values()) + (user_id,)
     
