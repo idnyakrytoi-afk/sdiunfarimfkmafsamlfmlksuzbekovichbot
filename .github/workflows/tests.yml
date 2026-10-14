@@ -1,0 +1,15 @@
+name: Python tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt ruff
+      - run: python -m ruff check . --select F821,F811,F823,E9
+      - run: python -m unittest discover -s tests -v

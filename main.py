@@ -17,6 +17,8 @@ import time
 from web import create_app
 import xml.etree.ElementTree as ET
 
+from json_state import JSON_LOCK, read_json, write_json
+
 import database # Импортируем наш новый модуль
 
 load_dotenv() # Загружаем переменные из .env файла
@@ -30,6 +32,7 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 # JSON функции удалены в пользу SQLite
 
 # 2. Временные словари
+background_tasks = {}
 voice_sessions = {}
 user_warnings = {}
 invite_warnings = {}
@@ -214,33 +217,28 @@ async def scheduler_loop():
     await bot.wait_until_ready()
     while not bot.is_closed():
         try:
-            try:
-                with open('scheduled.json', 'r', encoding='utf-8') as f:
-                    scheduled = json.load(f)
-            except FileNotFoundError:
-                scheduled = []
-
+            scheduled = read_json('scheduled.json', [])
             now = datetime.datetime.now(datetime.timezone.utc)
-            remaining = []
+            delivered = []
             for item in scheduled:
                 try:
                     dt = datetime.datetime.fromisoformat(item['datetime'])
-                    # if naive, assume UTC
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=datetime.timezone.utc)
                     if dt <= now:
                         ch = bot.get_channel(int(item['channel_id']))
                         if ch:
                             await ch.send(item['message'])
-                    else:
-                        remaining.append(item)
-                except Exception:
-                    # malformed entry -> skip
-                    continue
-
-            # rewrite file with remaining items
-            with open('scheduled.json', 'w', encoding='utf-8') as f:
-                json.dump(remaining, f, ensure_ascii=False, indent=2)
+                            delivered.append(item)
+                except Exception as error:
+                    print(f"[scheduler] item retained for retry: {error}")
+            with JSON_LOCK:
+                # Preserve items appended by the dashboard during network requests.
+                current = read_json('scheduled.json', [])
+                for item in delivered:
+                    if item in current:
+                        current.remove(item)
+                write_json('scheduled.json', current)
         except Exception as e:
             print(f"[scheduler] error: {e}")
         await asyncio.sleep(30)
@@ -251,11 +249,7 @@ async def feed_poller_loop():
     POLL_INTERVAL = int(os.environ.get('FEED_POLL_INTERVAL', 120))  # seconds
     while not bot.is_closed():
         try:
-            try:
-                with open('server_data.json', 'r', encoding='utf-8') as f:
-                    cfg = json.load(f)
-            except FileNotFoundError:
-                cfg = {}
+            cfg = read_json('server_data.json', {})
 
             feeds = cfg.get('feeds', [])
             state = cfg.get('feeds_state', {})
@@ -306,14 +300,15 @@ async def feed_poller_loop():
                                     else:
                                         link = f"https://youtu.be/{vid}"
                                     await ch.send(f"Новое видео: {link}")
-                                state[url] = vid
+                                    state[url] = vid
                     except Exception:
                         # per-feed error (request/parse) — skip this feed
                         continue
 
-            cfg['feeds_state'] = state
-            with open('server_data.json', 'w', encoding='utf-8') as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            with JSON_LOCK:
+                current = read_json('server_data.json', {})
+                current.setdefault('feeds_state', {}).update(state)
+                write_json('server_data.json', current)
         except Exception as e:
             print(f"[feed_poller] error: {e}")
         await asyncio.sleep(POLL_INTERVAL)
@@ -342,15 +337,17 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Ошибка синхронизации команд: {e}")
     # Запускаем ротатор presence в фоне
-    bot.loop.create_task(presence_rotator())
-    # Запускаем планировщик и поллер фидов
-    bot.loop.create_task(scheduler_loop())
-    bot.loop.create_task(feed_poller_loop())
-    bot.loop.create_task(giveaway_loop())
-    bot.loop.create_task(stats_tracker_loop())
+    # on_ready can run again after reconnects; keep one instance of each worker.
+    for worker in (presence_rotator, scheduler_loop, feed_poller_loop, giveaway_loop, stats_tracker_loop):
+        task = background_tasks.get(worker.__name__)
+        if task is None or task.done():
+            background_tasks[worker.__name__] = asyncio.create_task(worker())
 
     # Регистрируем персистентные view для кнопок
-    bot.add_view(GiveawayView(giveaway_id="placeholder"))
+    for item in load_giveaways():
+        if not item.get("winner_id"):
+            bot.add_view(GiveawayView(giveaway_id=item["id"]))
+    bot.add_view(TicketView())
 
     print(f"✅ Бот успешно запущен и авторизован как {bot.user}!")
     print("Ожидаю сообщений и команд...")
@@ -372,6 +369,31 @@ async def on_presence_update(before, after):
         # Эта ошибка будет появляться, пока не вставишь реальный ID
         print(f"[ERROR] Роль 'хороший участник' с ID {good_member_role_id} не найдена.")
         return
+
+
+    # Ищем ссылку в кастомном статусе
+    has_link_in_status = False
+    invite_link = globals().get('our_server_invite', 'discord.gg/') # Можно заменить на конкретную ссылку
+    for activity in after.activities:
+        if isinstance(activity, discord.CustomActivity) and activity.name and invite_link in activity.name:
+            has_link_in_status = True
+            break
+
+    # Выдаем роль, если есть ссылка и еще нет роли
+    if has_link_in_status and good_member_role not in after.roles:
+        try:
+            await after.add_roles(good_member_role, reason="Добавил ссылку на сервер в статус")
+            print(f"[INFO] Выдал роль 'хороший участник' пользователю {after.display_name}")
+        except discord.Forbidden:
+            print(f"[ERROR] Нет прав для выдачи роли 'хороший участник' пользователю {after.display_name}")
+
+    # Забираем роль, если ссылки больше нет, а роль есть
+    elif not has_link_in_status and good_member_role in after.roles:
+        try:
+            await after.remove_roles(good_member_role, reason="Убрал ссылку на сервер из статуса")
+            print(f"[INFO] Забрал роль 'хороший участник' у пользователя {after.display_name}")
+        except discord.Forbidden:
+            print(f"[ERROR] Нет прав для снятия роли 'хороший участник' у пользователя {after.display_name}")
 
 
 # ----------------- UI / Embeds helpers -----------------
@@ -495,30 +517,6 @@ async def presence_rotator():
             print(f"[presence_rotator] error: {e}")
         await asyncio.sleep(30)
 
-
-    # Ищем ссылку в кастомном статусе
-    has_link_in_status = False
-    invite_link = globals().get('our_server_invite', 'discord.gg/') # Можно заменить на конкретную ссылку
-    for activity in after.activities:
-        if isinstance(activity, discord.CustomActivity) and activity.name and invite_link in activity.name:
-            has_link_in_status = True
-            break
-
-    # Выдаем роль, если есть ссылка и еще нет роли
-    if has_link_in_status and good_member_role not in after.roles:
-        try:
-            await after.add_roles(good_member_role, reason="Добавил ссылку на сервер в статус")
-            print(f"[INFO] Выдал роль 'хороший участник' пользователю {after.display_name}")
-        except discord.Forbidden:
-            print(f"[ERROR] Нет прав для выдачи роли 'хороший участник' пользователю {after.display_name}")
-
-    # Забираем роль, если ссылки больше нет, а роль есть
-    elif not has_link_in_status and good_member_role in after.roles:
-        try:
-            await after.remove_roles(good_member_role, reason="Убрал ссылку на сервер из статуса")
-            print(f"[INFO] Забрал роль 'хороший участник' у пользователя {after.display_name}")
-        except discord.Forbidden:
-            print(f"[ERROR] Нет прав для снятия роли 'хороший участник' у пользователя {after.display_name}")
 
 @bot.event
 async def on_member_update(before, after):
@@ -1172,9 +1170,9 @@ def play_next(ctx):
         try:
             source = discord.FFmpegPCMAudio(track['url'], **FFMPEG_OPTIONS)
             ctx.voice_client.play(source, after=lambda e: bot.loop.call_soon_threadsafe(play_next, ctx))
-            bot.loop.create_task(ctx.send(f"🎶 Сейчас играет: **{track['title']}**"))
+            asyncio.run_coroutine_threadsafe(ctx.send(f"🎶 Сейчас играет: **{track['title']}**"), bot.loop)
         except Exception as e:
-            bot.loop.create_task(ctx.send(f"❌ Ошибка при воспроизведении следующего трека: {e}"))
+            asyncio.run_coroutine_threadsafe(ctx.send(f"❌ Ошибка при воспроизведении следующего трека: {e}"), bot.loop)
             bot.loop.call_soon_threadsafe(play_next, ctx) # Пробуем следующий трек при ошибке (безопасно)
 
 @bot.hybrid_command(name="play", description="Включить музыку с YouTube или добавить в очередь")
@@ -2436,6 +2434,32 @@ async def inventory(ctx, member: discord.Member = None):
     embed = paginator._get_page_embed()
     await ctx.send(embed=embed, view=paginator)
 
+class TicketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Создать тикет", style=discord.ButtonStyle.primary, custom_id="support:create_ticket")
+    async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        guild = interaction.guild
+        category = guild.get_channel(TICKET_CATEGORY_ID) if guild else None
+        if not isinstance(category, discord.CategoryChannel):
+            return await interaction.response.send_message("Категория тикетов не настроена.", ephemeral=True)
+        await interaction.response.defer(ephemeral=True)
+        name = f"ticket-{interaction.user.id}"
+        channel = discord.utils.get(category.text_channels, name=name)
+        if channel is None:
+            overwrites = {
+                guild.default_role: discord.PermissionOverwrite(view_channel=False),
+                interaction.user: discord.PermissionOverwrite(view_channel=True, send_messages=True),
+                guild.me: discord.PermissionOverwrite(view_channel=True, send_messages=True, manage_channels=True),
+            }
+            try:
+                channel = await guild.create_text_channel(name, category=category, overwrites=overwrites)
+            except discord.HTTPException:
+                return await interaction.followup.send("Не удалось создать тикет. Проверьте права бота.", ephemeral=True)
+        await interaction.followup.send(f"Ваш тикет: {channel.mention}", ephemeral=True)
+
+
 @bot.hybrid_command(name="setup_tickets", description="Отправить панель для тикетов")
 @commands.has_permissions(administrator=True)
 async def setup_tickets_cmd(ctx):
@@ -2823,6 +2847,7 @@ class GiveawayView(discord.ui.View):
     def __init__(self, giveaway_id: str):
         super().__init__(timeout=None)
         self.giveaway_id = giveaway_id
+        self.join_btn.custom_id = f"giveaway_join:{giveaway_id}"
 
     @discord.ui.button(label="🎉 Участвовать!", style=discord.ButtonStyle.success, custom_id="giveaway_join")
     async def join_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2835,6 +2860,8 @@ class GiveawayView(discord.ui.View):
         participants = g.get('participants', [])
         if user_id in participants:
             participants.remove(user_id)
+            g['participants'] = participants
+            await save_giveaways(giveaways)
             await interaction.response.send_message("❌ Вы вышли из розыгрыша.", ephemeral=True)
         else:
             participants.append(user_id)
@@ -2845,10 +2872,10 @@ class GiveawayView(discord.ui.View):
 @bot.hybrid_command(name="giveaway", description="Создать розыгрыш. Формат: /giveaway 1h Приз")
 @commands.has_permissions(manage_guild=True)
 async def giveaway(ctx, duration: str, *, prize: str):
-    td = parse_time_delta(duration) if 'parse_time_delta' in dir() else None
+    td = None
     if not td:
         total_seconds = 0
-        pattern = re.compile(r'(\d+)\s*(s|sec|m|min|h|ч|д|d)', re.IGNORECASE)
+        pattern = re.compile(r'(\d+)\s*(sec|min|s|m|h|ч|д|d)', re.IGNORECASE)
         matches = pattern.findall(duration)
         for val, unit in matches:
             val = int(val)
@@ -3140,25 +3167,6 @@ async def on_message_edit(before, after):
         embed.add_field(name="Стало", value=after.content or "Нет текста", inline=False)
         await log_channel.send(embed=embed)
 
-# Запуск бота: вставь свой токен Discord в кавычках
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-if not DISCORD_TOKEN:
-    print("❌ Токен бота не найден в .env файле!")
-else:
-    # Запускаем Flask dashboard в отдельном потоке (если нужно)
-    def _run_dashboard():
-        try:
-            app = create_app(bot)
-            app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False, use_reloader=False)
-        except Exception as e:
-            print(f"[dashboard] failed to start: {e}")
-
-    dashboard_thread = threading.Thread(target=_run_dashboard, daemon=True)
-    dashboard_thread.start()
-
-    bot.run(DISCORD_TOKEN)
-
-# --- AutoMod sync utilities ---
 async def discord_api_request(method: str, path: str, json_payload=None):
     """Простой HTTP wrapper для Discord API вызовов с бот-токеном"""
     token = os.getenv('DISCORD_TOKEN')
@@ -3267,3 +3275,25 @@ async def automod_clear(ctx):
             if s2 in (200, 204):
                 removed += 1
     await ctx.send(f'Удалено правил: {removed}')
+
+
+if __name__ == "__main__":
+    # Запуск бота: вставь свой токен Discord в кавычках
+    DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+    if not DISCORD_TOKEN:
+        print("❌ Токен бота не найден в .env файле!")
+    else:
+        # Запускаем Flask dashboard в отдельном потоке (если нужно)
+        def _run_dashboard():
+            try:
+                app = create_app(bot)
+                app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=False, use_reloader=False)
+            except Exception as e:
+                print(f"[dashboard] failed to start: {e}")
+
+        dashboard_thread = threading.Thread(target=_run_dashboard, daemon=True)
+        dashboard_thread.start()
+
+        bot.run(DISCORD_TOKEN)
+
+    # --- AutoMod sync utilities ---
